@@ -1,0 +1,72 @@
+name: Lineaje AI Policy Scan
+
+trigger: none
+pr: none
+
+parameters:
+  - name: createFixPr
+    displayName: Open a remediation PR with the suggested fixes
+    type: boolean
+    default: true
+
+variables:
+  - name: createFixPrFlag
+    ${{ if eq(parameters.createFixPr, true) }}:
+      value: --create-fix-pr
+    ${{ else }}:
+      value: ''
+  - name: reportPath
+    value: $(Build.ArtifactStagingDirectory)/unifai-report.md
+  - name: scannerPath
+    value: $(Agent.TempDirectory)/scm_unifai_scan_azure.py
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+    displayName: Checkout repository
+    fetchDepth: 1
+
+  - task: UsePythonVersion@0
+    displayName: Set up Python
+    inputs:
+      versionSpec: '3.11'
+
+  - script: pip install mcp==1.27.1
+    displayName: Install dependencies
+
+  - script: |
+      set -euo pipefail
+      cp .azuredevops/scm_unifai_scan_azure.py "$(scannerPath)"
+      mkdir -p "$(Build.ArtifactStagingDirectory)"
+    displayName: Prepare scanner
+
+  - script: |
+      set -euo pipefail
+      python "$(scannerPath)" \
+        --source-path . \
+        --exclude .git \
+        --exclude .azuredevops \
+        $(createFixPrFlag) | tee "$(reportPath)"
+    displayName: Run Lineaje AI policy scan
+    env:
+      LINEAJE_PAT_TOKEN: $(LINEAJE_PAT_TOKEN)
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      # If required, replace with AZURE_DEVOPS_PAT here
+
+  - script: |
+      set -euo pipefail
+      if [ -s "$(reportPath)" ]; then
+        echo "##vso[task.uploadsummary]$(reportPath)"
+      else
+        echo "No report produced - nothing to attach."
+      fi
+    displayName: Attach report to run summary
+    condition: always()
+
+  - publish: $(reportPath)
+    artifact: unifai-report
+    displayName: Publish report artifact
+    condition: always()
+    continueOnError: true
