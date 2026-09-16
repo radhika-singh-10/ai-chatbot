@@ -584,12 +584,26 @@ async def streamablehttp_client(
         or os.environ.get("SSL_CERT_FILE")
         or ""
     ).strip()
+    # Opt-in only (unlike some other scripts that default this to insecure) —
+    # this file is also used for real customer runs against the actual SaaS
+    # endpoint, so TLS verification must stay on unless explicitly disabled
+    # for a known, private endpoint (e.g. a self-signed demo VM).
+    insecure = (os.environ.get("MCP_TLS_INSECURE_SKIP_VERIFY", "") or "").strip().lower() in ("1", "true", "yes")
 
     if httpx_client_factory is not None:
         client = httpx_client_factory(headers=headers, timeout=httpx_timeout, auth=auth)
     elif ca_bundle:
         client = httpx.AsyncClient(
             follow_redirects=True, headers=headers, timeout=httpx_timeout, auth=auth, verify=ca_bundle,
+        )
+    elif insecure:
+        logger.warning(
+            "MCP_TLS_INSECURE_SKIP_VERIFY is set — TLS certificate and hostname "
+            "verification are DISABLED for the MCP connection. Do not use this "
+            "against anything but a known, private endpoint."
+        )
+        client = httpx.AsyncClient(
+            follow_redirects=True, headers=headers, timeout=httpx_timeout, auth=auth, verify=False,
         )
     else:
         client = create_mcp_http_client(headers=headers, timeout=httpx_timeout, auth=auth)
