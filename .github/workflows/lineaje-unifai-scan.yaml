@@ -1,46 +1,35 @@
-name: Lineaje UnifAI Scan
+name: Lineaje AI Policy Scan
 
 on:
   workflow_dispatch:
-    inputs:
-      create_fix_pr:
-        description: "Open a remediation PR with the suggested fixes"
-        type: boolean
-        default: true
-
-permissions:
-  contents: write
-  pull-requests: write
 
 jobs:
-  lineaje-scan:
+  scan:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install mcp==1.27.1
+        run: pip install mcp
 
-      - name: Prepare scanner
-        run: |
-          # Preserve the scanner before removing .github from scan input
-          cp .github/scm_unifai_scan.py /tmp/scm_unifai_scan.py
-
-          # Exclude GitHub config/workflows/scripts and git internals from the scan
-          rm -rf .github .git
+      - name: Write MCP CA bundle
+        run: echo "${{ secrets.MCP_CA_BUNDLE_PEM }}" > "${{ runner.temp }}/mcp-ca.pem"
 
       - name: Run Lineaje AI policy scan
         env:
-          LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          LINEAJE_PAT_TOKEN: ${{ secrets.lineaje_pat_token }}
+          GH_TOKEN: ${{ secrets.gha_token }}
+          MCP_CA_BUNDLE: ${{ runner.temp }}/mcp-ca.pem
         run: |
-          python /tmp/scm_unifai_scan.py \
+          python .github/scripts/scm_unifai_scan_azure.py \
             --source-path . \
-            ${{ inputs.create_fix_pr && '--create-fix-pr' || '' }} >> "$GITHUB_STEP_SUMMARY"
+            --repo ${{ github.repository }} \
+            --branch ${{ github.ref_name }} \
+            --head-sha ${{ github.sha }} \
+            --exclude .git \
+            --mcp-server-url https://172.206.26.109/mcp \
+            --create-fix-pr
