@@ -17,7 +17,7 @@ jobs:
         run: pip install mcp httpx
 
       - name: Write MCP CA bundle
-        run: echo "${{ secrets.MCP_CA_BUNDLE_PEM }}" > "${{ runner.temp }}/mcp-ca.pem"
+        run: echo "${{ secrets.MCP_CA_BUNDLE_PEM }}" | base64 -d > "${{ runner.temp }}/mcp-ca.pem"
 
       - name: Run Lineaje AI policy scan
         env:
