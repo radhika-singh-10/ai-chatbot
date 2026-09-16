@@ -28,5 +28,5 @@ jobs:
             --branch ${{ github.ref_name }} \
             --head-sha ${{ github.sha }} \
             --exclude .git \
-            --mcp-server-url https://localhost/mcp \
+            --mcp-server-url http://172.206.26.109/mcp \
             --create-fix-pr
