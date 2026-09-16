@@ -1,31 +1,31 @@
 #!/usr/bin/env python3
-"""Lineaje UnifAI Policy Scanner — Azure Pipelines edition.
+"""Lineaje UnifAI Policy Scanner — GitHub Actions edition.
 
 Scans already-checked-out source code against Lineaje AI security policies and
-optionally opens a remediation pull request built from the ``fix_code`` patches
-the policy engine returns. Designed to run on an Azure Pipelines agent where the
-repository is already checked out against Azure Repos (Git).
+optionally opens a remediation PR built from the ``fix_code`` patches the policy
+engine returns. Designed to run on a GitHub-managed runner where the repository
+is already checked out.
 
-Self-contained: the only SCM code here is a minimal Azure DevOps REST client
-(:class:`AzureDevOpsClient`, defined below) covering the ref/push/PR calls the
-remediation step makes, so this script is the only file a pipeline needs to
+Self-contained: the only SCM code here is a minimal GitHub REST client
+(:class:`GitHubClient`, defined below) covering the branch/commit/PR calls the
+remediation step makes, so this script is the only file a workflow needs to
 copy. Nothing outside the Python stdlib is required beyond the ``mcp`` SDK.
 
-Every file under ``--source-path`` is scanned, minus any ``--exclude`` roots.
-There is no other filtering and no special handling for dependency manifests:
-the walk collects everything it finds, splits it into batches of
-``UNIFAI_FILE_BATCH_SIZE`` files, and uploads each batch archive as-is.
+Every file under ``--source-path`` is scanned. There is no exclusion list and no
+special handling for dependency manifests: the walk collects everything it
+finds, splits it into batches of ``UNIFAI_FILE_BATCH_SIZE`` files, and uploads
+each batch archive as-is. Trimming the scan input (e.g. dropping ``.git``) is
+the caller's job — the workflow does it before invoking this script.
 
 Usage::
 
-    python scm_unifai_scan.py --source-path . \\
-        --exclude .git --exclude .azuredevops --create-fix-pr
+    python scm_unifai_scan.py --source-path . --create-fix-pr
 
 Output:
 
-* **stdout** — the markdown policy report. The pipeline redirects this into a
-  file that it attaches to the run summary with ``##vso[task.uploadsummary]``,
-  so it renders on the run's Extensions tab rather than filling the step log.
+* **stdout** — the markdown policy report. The workflow redirects this into
+  ``$GITHUB_STEP_SUMMARY`` so it renders on the run summary page rather than
+  filling the step log.
 * **stderr** — progress logs, ending with a one-line result such as
   ``Result: ❌ Not Compliant — 2 violation(s)``.
 
@@ -35,22 +35,9 @@ Required environment variable::
 
 Optional environment variables::
 
-    SYSTEM_ACCESSTOKEN       — the pipeline's own OAuth token, used by --create-fix-pr.
-                               Azure Pipelines only exposes it to a step that maps it
-                               explicitly: ``env: SYSTEM_ACCESSTOKEN: $(System.AccessToken)``
-    AZURE_DEVOPS_PAT / AZURE_DEVOPS_EXT_PAT
-                             — an Azure DevOps PAT to use instead of SYSTEM_ACCESSTOKEN
+    GITHUB_TOKEN / GH_TOKEN  — needed by --create-fix-pr to push the branch and open the PR
     UNIFAI_FILE_BATCH_SIZE   — files per batch (default 100; 0 puts everything in one batch)
     MCP_SERVER_URL           — override the Lineaje MCP endpoint
-
-Predefined pipeline variables consumed when the matching flag is not passed::
-
-    SYSTEM_TEAMFOUNDATIONCOLLECTIONURI  — https://dev.azure.com/{org}/   (--org-url)
-    SYSTEM_TEAMPROJECT                  — project name                   (--project)
-    BUILD_REPOSITORY_NAME               — repository name                (--repo)
-    BUILD_REPOSITORY_ID                 — repository GUID                (--repo-id)
-    BUILD_SOURCEBRANCH                  — refs/heads/<branch>            (--branch)
-    BUILD_SOURCEVERSION                 — commit id                      (--head-sha)
 
 Exit codes::
 
@@ -62,7 +49,6 @@ Exit codes::
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
 import base64
 import json
@@ -82,30 +68,139 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-logger = logging.getLogger("ado_repo_scan")
+logger = logging.getLogger("gha_repo_scan")
 
 # ===========================================================================
 # Constants
 # ===========================================================================
 
+MCP_SERVER_URL = "https://172.206.26.109/mcp"  # Wipro/Ema combined-service VM
 
-MCP_SERVER_URL = "https://172.206.26.109/mcp"
+
+def _mcp_http_client_with_extra_ca(headers=None, timeout=None, auth=None):
+    """Same defaults as mcp's create_mcp_http_client, plus (if configured) one
+    extra CA added to — not replacing — the normal system/certifi trust store.
+
+    The Wipro VM's Caddy `tls internal` cert is self-signed, and httpx (which
+    the mcp SDK's streamablehttp_client uses) defaults to certifi's public CA
+    bundle only — unlike stdlib ssl/requests, it does NOT read
+    SSL_CERT_FILE/REQUESTS_CA_BUNDLE on its own. A fresh CI runner with no
+    extra trust config therefore fails the TLS handshake before any request is
+    even sent, surfacing to a caller only as a generic "unhandled errors in a
+    TaskGroup (1 sub-exception)", with nothing logged server-side because the
+    connection never completes.
+
+    No certificate content lives in this script: point MCP_CA_BUNDLE (or the
+    same REQUESTS_CA_BUNDLE / SSL_CERT_FILE convention scripts/run_demo_scan.sh
+    already uses) at a CA file supplied separately by the workflow — e.g. a
+    repo/org secret written to a temp file in an earlier step. Unset, this is
+    a no-op: behavior is identical to the SDK's own create_mcp_http_client.
+    """
+    import ssl
+
+    import httpx
+
+    # Defaults to "1" (insecure) when unset — set MCP_TLS_INSECURE_SKIP_VERIFY=0/false/no
+    # explicitly to turn verification back on. Only leave this default on against a
+    # known, private endpoint reachable solely by this workflow.
+    insecure = (os.environ.get("MCP_TLS_INSECURE_SKIP_VERIFY", "1") or "1").strip().lower() in ("1", "true", "yes")
+    verify: Any
+    if insecure:
+        logger.warning(
+            "MCP_TLS_INSECURE_SKIP_VERIFY is set — TLS certificate and hostname "
+            "verification are DISABLED for the MCP connection. Do not use this "
+            "against anything but a known, private endpoint."
+        )
+        verify = False
+    else:
+        ctx = ssl.create_default_context()
+        ca_bundle_path = (
+            os.environ.get("MCP_CA_BUNDLE")
+            or os.environ.get("REQUESTS_CA_BUNDLE")
+            or os.environ.get("SSL_CERT_FILE")
+            or ""
+        ).strip()
+        if ca_bundle_path:
+            ctx.load_verify_locations(cafile=ca_bundle_path)
+        verify = ctx
+
+    kwargs: Dict[str, Any] = {"follow_redirects": True, "verify": verify}
+    # streamablehttp_client (mcp SDK) always passes an explicit httpx.Timeout here
+    # (built from its own timeout/sse_read_timeout params) — this default (matching
+    # the SDK's own bare defaults: 30s connect, 300s read) only matters if this
+    # factory is ever called directly.
+    kwargs["timeout"] = timeout if timeout is not None else httpx.Timeout(30, read=300)
+    if headers is not None:
+        kwargs["headers"] = headers
+    if auth is not None:
+        kwargs["auth"] = auth
+    return httpx.AsyncClient(**kwargs)
+
+
+# ``streamablehttp_client`` (this exact name) was a deprecated alias for the
+# canonical ``streamable_http_client`` in the ``mcp`` PyPI package. Some ``mcp``
+# releases have removed the deprecated alias outright, which breaks on any
+# environment that installs ``mcp`` unpinned (e.g. a fresh host picking up
+# whatever's newest — confirmed live: mcp==2.2.0 raises "ImportError: cannot
+# import name 'streamablehttp_client' from 'mcp.client.streamable_http'").
+# Reimplemented here against the still-supported ``streamable_http_client`` so
+# the call sites below keep working unchanged regardless of which alias the
+# installed mcp version kept. Logic mirrors the (now possibly-removed)
+# deprecated wrapper's own implementation exactly — same signature, same
+# behavior — and defaults to _mcp_http_client_with_extra_ca so the CA/insecure
+# handling above still applies without every call site repeating it.
+from contextlib import asynccontextmanager as _asynccontextmanager
+from datetime import timedelta as _timedelta
+
+
+@_asynccontextmanager
+async def _streamablehttp_client_compat(
+    url,
+    headers=None,
+    timeout=30,
+    sse_read_timeout=60 * 5,
+    terminate_on_close=True,
+    httpx_client_factory=None,
+    auth=None,
+):
+    import httpx
+    from mcp.client.streamable_http import streamable_http_client
+
+    factory = httpx_client_factory or _mcp_http_client_with_extra_ca
+    timeout_seconds = timeout.total_seconds() if isinstance(timeout, _timedelta) else timeout
+    sse_read_timeout_seconds = (
+        sse_read_timeout.total_seconds() if isinstance(sse_read_timeout, _timedelta) else sse_read_timeout
+    )
+    client = factory(
+        headers=headers,
+        timeout=httpx.Timeout(timeout_seconds, read=sse_read_timeout_seconds),
+        auth=auth,
+    )
+    async with client:
+        async with streamable_http_client(
+            url, http_client=client, terminate_on_close=terminate_on_close,
+        ) as streams:
+            # mcp==2.2.0's streamable_http_client yields a 2-tuple
+            # (read_stream, write_stream) — the get_session_id_callback third
+            # element was dropped from the yield entirely (older/other mcp
+            # versions may still yield 3). Normalize to 3 here so every call
+            # site's `async with ... as (read, write, _):` keeps working
+            # unchanged regardless of which shape the installed version uses.
+            if len(streams) == 2:
+                streams = (*streams, None)
+            yield streams
+
 
 MAX_SCAN_WORKERS = 4
-REMEDIATION_BRANCH_PREFIX = "remediation/unifai-ado"
+REMEDIATION_BRANCH_PREFIX = "remediation/unifai-gha"
 DEFAULT_UNIFAI_FILE_BATCH_SIZE = 100
-
-AZURE_DEVOPS_API_VERSION = "7.1"
-# Azure DevOps rejects PR descriptions longer than this (GitHub's cap is 65536).
-AZURE_PR_DESCRIPTION_LIMIT = 4000
-AZURE_PR_TITLE_LIMIT = 400
-GITHUB_PR_BODY_SAFE_LIMIT = 60_000
 
 _DEFAULT_LINEAJE_TOKEN_REFRESH_SKEW_SEC = 120
 _LINEAJE_NATIVE_RENEW_ACCESS_TOKEN_URL_PROD = (
     "https://lineaje-identity-service.v2.prod.veedna.com"
     "/lineajeidentity/api/v1/auth/native/renew-access-token"
 )
+
 
 # ===========================================================================
 # Azure DevOps client — remediation branch, commit, pull request
@@ -529,17 +624,6 @@ def _batch_size(total_files: int) -> int:
 # MCP scan (SDK path only)
 # ===========================================================================
 
-# --- mcp SDK compat shim ----------------------------------------------------
-# ``streamablehttp_client`` (this exact name) was a deprecated alias for the
-# canonical ``streamable_http_client`` in the ``mcp`` PyPI package. Some ``mcp``
-# releases have removed the deprecated alias outright, which breaks on any
-# environment that installs ``mcp`` unpinned (e.g. a pipeline agent picking up
-# whatever's newest — confirmed live elsewhere: "ImportError: cannot import
-# name 'streamablehttp_client' from 'mcp.client.streamable_http'"). Reimplemented
-# here against the still-supported ``streamable_http_client`` so the call sites
-# below keep working unchanged regardless of which alias the installed mcp
-# version kept. Logic mirrors the (now possibly-removed) deprecated wrapper's
-# own implementation exactly — same signature, same behavior.
 from contextlib import asynccontextmanager as _asynccontextmanager
 from datetime import timedelta as _timedelta
 
