@@ -25,7 +25,7 @@ jobs:
           GH_TOKEN: ${{ secrets.gha_token }}
           MCP_CA_BUNDLE: ${{ runner.temp }}/mcp-ca.pem
         run: |
-          python .github/scripts/scm_unifai_scan_azure.py \
+          python .github/scripts/scm_unifai_scan.py \
             --source-path . \
             --repo ${{ github.repository }} \
             --branch ${{ github.ref_name }} \
