@@ -16,14 +16,11 @@ jobs:
       - name: Install dependencies
         run: pip install mcp httpx
 
-      - name: Write MCP CA bundle
-        run: echo "${{ secrets.MCP_CA_BUNDLE_PEM }}" | base64 -d > "${{ runner.temp }}/mcp-ca.pem"
-
       - name: Run Lineaje AI policy scan
         env:
           LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
-          MCP_CA_BUNDLE: ${{ runner.temp }}/mcp-ca.pem
+          MCP_TLS_INSECURE_SKIP_VERIFY: "1"
         run: |
           python .github/scripts/scm_unifai_scan.py \
             --source-path . \
@@ -31,5 +28,5 @@ jobs:
             --branch ${{ github.ref_name }} \
             --head-sha ${{ github.sha }} \
             --exclude .git \
-            --mcp-server-url https://172.206.26.109/mcp \
+            --mcp-server-url https://localhost/mcp \
             --create-fix-pr
